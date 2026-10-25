@@ -1,0 +1,14 @@
+# Python virtual envs
+.venv/
+venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Recorded audio — don't commit test voice data
+recordings/
+
+# OS cruft
+.DS_Store

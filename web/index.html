@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Voice Assistant — Phase 1</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; max-width: 44rem; }
+    h1   { font-size: 1.3rem; }
+    button { font-size: 1rem; padding: 0.6rem 1.2rem; margin-right: 0.5rem; }
+    #log { background: #f4f4f4; padding: 0.8rem; border-radius: 6px;
+           height: 22rem; overflow-y: auto;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           font-size: 0.82rem; white-space: pre-wrap; }
+    .warn { color: #a60; }
+    .err  { color: #c00; }
+    .ok   { color: #060; }
+  </style>
+</head>
+<body>
+  <h1>Voice Assistant — Phase 1 (mic → server → .wav)</h1>
+  <p>Click <b>Start</b>, speak into your mic, then click <b>Stop</b>. The audio is
+     streamed in 20&nbsp;ms chunks to the Python server, which saves it as a
+     <code>.wav</code> file and sends back a summary.</p>
+
+  <div>
+    <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <h3>Log</h3>
+  <div id="log"></div>
+
+<script>
+"use strict";
+
+// -----------------------------------------------------------------------------
+// Module-scope state. These are set during start() and torn down in cleanup().
+// We keep them here (not inside start()) so that stop() can reach them.
+// -----------------------------------------------------------------------------
+let audioContext = null;  // Web Audio graph owner
+let mediaStream  = null;  // the raw mic stream from getUserMedia
+let workletNode  = null;  // our AudioWorkletNode wrapping mic-worklet.js
+let ws           = null;  // WebSocket to the Python server
+
+const startBtn = document.getElementById("start");
+const stopBtn  = document.getElementById("stop");
+const logEl    = document.getElementById("log");
+
+// Tiny logger that prints to the on-page div with a timestamp.
+function log(msg, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// -----------------------------------------------------------------------------
+// start(): wire up mic → worklet → WebSocket.
+// -----------------------------------------------------------------------------
+async function start() {
+  startBtn.disabled = true;
+
+  try {
+    // 1) Ask the browser for the microphone.
+    //
+    //    - channelCount: 1          → mono. We don't need stereo for speech.
+    //    - echoCancellation: true   → Chrome removes playback-into-mic echo.
+    //    - noiseSuppression: true   → Chrome dampens steady background noise.
+    //    - autoGainControl: true    → Chrome auto-normalizes loudness.
+    //
+    //    These three "cleanup" flags make downstream speech-to-text much
+    //    happier. They're hints to the browser; it may ignore any of them.
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    log("mic granted", "ok");
+
+    // 2) Create an AudioContext asking for a 16 kHz sample rate.
+    //
+    //    The mic probably captures at 48 kHz natively. By requesting 16000 Hz
+    //    here, we ask the browser to resample for us — much simpler than
+    //    writing a resampler ourselves. If the browser can't honor it, we
+    //    warn the user; otherwise the whole pipeline runs at 16 kHz end-to-end.
+    audioContext = new AudioContext({ sampleRate: 16000 });
+    log(`AudioContext sampleRate = ${audioContext.sampleRate}`);
+    if (audioContext.sampleRate !== 16000) {
+      log(`WARNING: expected 16000 Hz, got ${audioContext.sampleRate}. ` +
+          `The .wav will play back at the wrong speed.`, "warn");
+    }
+
+    // 3) Load the worklet module. The URL is resolved relative to this page.
+    //    This fetches the .js file, parses it in the audio thread's realm,
+    //    and runs its top-level registerProcessor() call so "mic-chunker"
+    //    becomes a known processor name we can instantiate next.
+    await audioContext.audioWorklet.addModule("mic-worklet.js");
+
+    // 4) Build the audio graph:
+    //       mic source --> workletNode
+    //
+    //    Note that we do NOT connect workletNode to audioContext.destination.
+    //    If we did, you'd hear yourself through the speakers (bad for echo).
+    //    The worklet only sends data out via its message port.
+    const source = audioContext.createMediaStreamSource(mediaStream);
+    workletNode = new AudioWorkletNode(audioContext, "mic-chunker");
+    source.connect(workletNode);
+
+    // 5) Open the WebSocket. We send to the same host that served this page,
+    //    so it works whether you're on localhost or a LAN IP.
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+
+    // Only start forwarding audio once the socket is open, and only after
+    // we've sent the "start" control message so the server knows the format.
+    ws.onopen = () => {
+      log("WebSocket open — sending start", "ok");
+      ws.send(JSON.stringify({ type: "start", sample_rate: 16000 }));
+
+      // Attach the worklet-message handler here (not earlier) so we don't
+      // try to send audio chunks over a socket that isn't open yet.
+      workletNode.port.onmessage = (event) => {
+        // event.data is an ArrayBuffer of Int16 samples (640 bytes = 320 samples).
+        // Send it as a BINARY WebSocket frame — not base64, not JSON. The
+        // server will treat it as the raw PCM payload.
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(event.data);
+        }
+      };
+
+      stopBtn.disabled = false;
+    };
+
+    // Messages from the server are JSON text in Phase 1 (e.g. the summary).
+    ws.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        log(`server: ${event.data}`);
+      } else {
+        log(`server: <binary ${event.data.byteLength} bytes>`);
+      }
+    };
+
+    ws.onerror = () => log("WebSocket error", "err");
+    ws.onclose = (e) => log(`WebSocket closed (code ${e.code})`);
+
+  } catch (err) {
+    log(`start failed: ${err.message}`, "err");
+    await cleanup();
+    startBtn.disabled = false;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// stop(): tell the server to finalize, then tear down the local pipeline.
+// -----------------------------------------------------------------------------
+async function stop() {
+  stopBtn.disabled = true;
+
+  // Tell the server we're done so it writes the .wav and sends the summary.
+  // Do this BEFORE tearing anything else down, so the message is actually sent.
+  try {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "stop" }));
+    }
+  } catch (err) {
+    log(`stop send failed: ${err.message}`, "err");
+  }
+
+  await cleanup();
+  startBtn.disabled = false;
+}
+
+// -----------------------------------------------------------------------------
+// cleanup(): tear down the mic, the audio graph, and (eventually) the socket.
+// Safe to call multiple times — every step guards for null.
+// -----------------------------------------------------------------------------
+async function cleanup() {
+  // Stop forwarding audio immediately so no chunks arrive after "stop".
+  if (workletNode) {
+    try { workletNode.port.onmessage = null; workletNode.disconnect(); } catch {}
+    workletNode = null;
+  }
+
+  // Stop the physical mic (turns off the browser's recording indicator).
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((t) => t.stop());
+    mediaStream = null;
+  }
+
+  // Close the audio graph.
+  if (audioContext) {
+    try { await audioContext.close(); } catch {}
+    audioContext = null;
+  }
+
+  // Give the server a brief grace period to deliver its summary message
+  // before we close the socket. 1 second is plenty for a tiny JSON reply.
+  if (ws) {
+    const closing = ws;
+    ws = null;
+    setTimeout(() => {
+      if (closing.readyState === WebSocket.OPEN) closing.close();
+    }, 1000);
+  }
+}
+
+startBtn.addEventListener("click", start);
+stopBtn.addEventListener("click", stop);
+</script>
+</body>
+</html>
