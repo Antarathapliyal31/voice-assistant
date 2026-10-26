@@ -7,8 +7,14 @@
     body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; max-width: 44rem; }
     h1   { font-size: 1.3rem; }
     button { font-size: 1rem; padding: 0.6rem 1.2rem; margin-right: 0.5rem; }
+    #status { font-size: 1.6rem; font-weight: 600; margin: 1rem 0;
+              padding: 0.9rem 1rem; border-radius: 8px; background: #eef;
+              border: 1px solid #dde; }
+    #status.listening { background: #eef; border-color: #ccd; }
+    #status.speaking  { background: #fde; border-color: #e9b; }
+    #status.ended     { background: #efe; border-color: #beb; }
     #log { background: #f4f4f4; padding: 0.8rem; border-radius: 6px;
-           height: 22rem; overflow-y: auto;
+           height: 20rem; overflow-y: auto;
            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
            font-size: 0.82rem; white-space: pre-wrap; }
     .warn { color: #a60; }
@@ -26,6 +32,9 @@
     <button id="start">Start</button>
     <button id="stop" disabled>Stop</button>
   </div>
+
+  <!-- Big live status line driven by VAD events from the server. -->
+  <div id="status">ready</div>
 
   <h3>Log</h3>
   <div id="log"></div>
@@ -45,6 +54,12 @@ let ws           = null;  // WebSocket to the Python server
 const startBtn = document.getElementById("start");
 const stopBtn  = document.getElementById("stop");
 const logEl    = document.getElementById("log");
+const statusEl = document.getElementById("status");
+
+// Timer id for the "end of turn" message that briefly flashes before we
+// fall back to "listening..." — tracked so we can cancel it if a new
+// speech_start arrives in that window.
+let endTurnFlashTimer = null;
 
 // Tiny logger that prints to the on-page div with a timestamp.
 function log(msg, cls) {
@@ -53,6 +68,13 @@ function log(msg, cls) {
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
+}
+
+// setStatus updates the big status line AND tags it with a CSS class so we
+// can colour it per state. The CSS class names mirror the VAD state names.
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls || "";
 }
 
 // -----------------------------------------------------------------------------
@@ -120,13 +142,13 @@ async function start() {
     ws.onopen = () => {
       log("WebSocket open — sending start", "ok");
       ws.send(JSON.stringify({ type: "start", sample_rate: 16000 }));
+      setStatus("🎧 listening...", "listening");
 
       // Attach the worklet-message handler here (not earlier) so we don't
       // try to send audio chunks over a socket that isn't open yet.
       workletNode.port.onmessage = (event) => {
         // event.data is an ArrayBuffer of Int16 samples (640 bytes = 320 samples).
-        // Send it as a BINARY WebSocket frame — not base64, not JSON. The
-        // server will treat it as the raw PCM payload.
+        // Send it as a BINARY WebSocket frame — not base64, not JSON.
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(event.data);
         }
@@ -135,12 +157,42 @@ async function start() {
       stopBtn.disabled = false;
     };
 
-    // Messages from the server are JSON text in Phase 1 (e.g. the summary).
+    // Messages from the server are JSON text (vad events + the final summary).
     ws.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        log(`server: ${event.data}`);
-      } else {
+      if (typeof event.data !== "string") {
         log(`server: <binary ${event.data.byteLength} bytes>`);
+        return;
+      }
+      log(`server: ${event.data}`);
+
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+
+      if (msg.type === "vad") {
+        // Any new speech_start cancels a pending "end of turn" flash.
+        if (endTurnFlashTimer) {
+          clearTimeout(endTurnFlashTimer);
+          endTurnFlashTimer = null;
+        }
+        if (msg.event === "speech_start") {
+          setStatus("🎤 speaking...", "speaking");
+        } else if (msg.event === "turn_end") {
+          setStatus(`✅ end of turn (${msg.duration_s.toFixed(1)} s)`, "ended");
+          // Fall back to the listening state after a short beat so the user
+          // sees the confirmation but doesn't get stuck on it.
+          endTurnFlashTimer = setTimeout(() => {
+            // Only revert if the mic is still live.
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              setStatus("🎧 listening...", "listening");
+            }
+            endTurnFlashTimer = null;
+          }, 1500);
+        }
+      } else if (msg.type === "summary") {
+        setStatus(
+          `done — ${msg.turns} turn(s), ${msg.duration_s.toFixed(1)}s total`,
+          ""
+        );
       }
     };
 
@@ -179,6 +231,9 @@ async function stop() {
 // Safe to call multiple times — every step guards for null.
 // -----------------------------------------------------------------------------
 async function cleanup() {
+  // Cancel any pending "end of turn" flash so it doesn't fight the final status.
+  if (endTurnFlashTimer) { clearTimeout(endTurnFlashTimer); endTurnFlashTimer = null; }
+
   // Stop forwarding audio immediately so no chunks arrive after "stop".
   if (workletNode) {
     try { workletNode.port.onmessage = null; workletNode.disconnect(); } catch {}

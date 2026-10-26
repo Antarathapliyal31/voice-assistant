@@ -1,2 +1,10 @@
 fastapi>=0.110
 uvicorn[standard]>=0.27
+
+# Voice activity detection (Phase 2)
+silero-vad>=6.0          # pulls torch transitively
+onnxruntime>=1.17        # used by silero-vad when onnx=True
+numpy>=1.26              # Int16 -> float32 conversion for VAD input
+
+# Tests
+pytest>=8.0
