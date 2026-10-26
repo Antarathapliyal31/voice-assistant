@@ -10,5 +10,12 @@ __pycache__/
 # Recorded audio — don't commit test voice data
 recordings/
 
+# Latency / debug logs
+logs/
+
+# API keys and local overrides
+.env
+.env.local
+
 # OS cruft
 .DS_Store

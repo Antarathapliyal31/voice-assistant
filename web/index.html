@@ -2,17 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Voice Assistant — Phase 1</title>
+  <title>Voice Assistant — Phase 3 (naive pipeline)</title>
   <style>
-    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; max-width: 44rem; }
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 2rem; max-width: 46rem; }
     h1   { font-size: 1.3rem; }
     button { font-size: 1rem; padding: 0.6rem 1.2rem; margin-right: 0.5rem; }
+
     #status { font-size: 1.6rem; font-weight: 600; margin: 1rem 0;
               padding: 0.9rem 1rem; border-radius: 8px; background: #eef;
               border: 1px solid #dde; }
     #status.listening { background: #eef; border-color: #ccd; }
     #status.speaking  { background: #fde; border-color: #e9b; }
+    #status.thinking  { background: #ffe; border-color: #ec9; }
+    #status.talking   { background: #e8f3ff; border-color: #9bd; }
     #status.ended     { background: #efe; border-color: #beb; }
+
     #log { background: #f4f4f4; padding: 0.8rem; border-radius: 6px;
            height: 20rem; overflow-y: auto;
            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -20,21 +24,33 @@
     .warn { color: #a60; }
     .err  { color: #c00; }
     .ok   { color: #060; }
+    .you  { color: #04a; font-weight: 600; }
+    .toy  { color: #850; font-weight: 600; }
+
+    #latency { margin-top: 1rem; }
+    #latency table { border-collapse: collapse; font-size: 0.9rem; }
+    #latency td { padding: 0.15rem 0.6rem; }
+    #latency td:first-child { color: #666; }
+    #latency td:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums; }
+    #latency .ttfa { font-weight: 700; }
   </style>
 </head>
 <body>
-  <h1>Voice Assistant — Phase 1 (mic → server → .wav)</h1>
-  <p>Click <b>Start</b>, speak into your mic, then click <b>Stop</b>. The audio is
-     streamed in 20&nbsp;ms chunks to the Python server, which saves it as a
-     <code>.wav</code> file and sends back a summary.</p>
+  <h1>Voice Assistant — Phase 3 (naive pipeline)</h1>
+  <p>Click <b>Start</b>, ask a question, then wait. The server runs STT → LLM → TTS
+     strictly sequentially and sends back the MP3 of the reply. Latency breakdown
+     appears below each turn.</p>
 
   <div>
     <button id="start">Start</button>
     <button id="stop" disabled>Stop</button>
   </div>
 
-  <!-- Big live status line driven by VAD events from the server. -->
+  <!-- Big live status line. -->
   <div id="status">ready</div>
+
+  <h3>Latency (last turn)</h3>
+  <div id="latency"><em>no turn yet</em></div>
 
   <h3>Log</h3>
   <div id="log"></div>
@@ -43,25 +59,23 @@
 "use strict";
 
 // -----------------------------------------------------------------------------
-// Module-scope state. These are set during start() and torn down in cleanup().
-// We keep them here (not inside start()) so that stop() can reach them.
+// Module-scope state. Lives across Start/Stop clicks so stop() can tear down.
 // -----------------------------------------------------------------------------
-let audioContext = null;  // Web Audio graph owner
-let mediaStream  = null;  // the raw mic stream from getUserMedia
-let workletNode  = null;  // our AudioWorkletNode wrapping mic-worklet.js
-let ws           = null;  // WebSocket to the Python server
+let micContext      = null;  // AudioContext for the mic (16 kHz)
+let playbackContext = null;  // SEPARATE AudioContext for TTS playback (default rate)
+let mediaStream     = null;  // the raw mic stream from getUserMedia
+let workletNode     = null;  // AudioWorkletNode wrapping mic-worklet.js
+let ws              = null;  // WebSocket to the Python server
 
-const startBtn = document.getElementById("start");
-const stopBtn  = document.getElementById("stop");
-const logEl    = document.getElementById("log");
-const statusEl = document.getElementById("status");
+const startBtn  = document.getElementById("start");
+const stopBtn   = document.getElementById("stop");
+const logEl     = document.getElementById("log");
+const statusEl  = document.getElementById("status");
+const latencyEl = document.getElementById("latency");
 
-// Timer id for the "end of turn" message that briefly flashes before we
-// fall back to "listening..." — tracked so we can cancel it if a new
-// speech_start arrives in that window.
-let endTurnFlashTimer = null;
-
-// Tiny logger that prints to the on-page div with a timestamp.
+// -----------------------------------------------------------------------------
+// Tiny helpers.
+// -----------------------------------------------------------------------------
 function log(msg, cls) {
   const line = document.createElement("div");
   if (cls) line.className = cls;
@@ -70,29 +84,46 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-// setStatus updates the big status line AND tags it with a CSS class so we
-// can colour it per state. The CSS class names mirror the VAD state names.
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className = cls || "";
 }
 
+function sendControl(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+function renderLatency(msg) {
+  // msg has stt_ms, llm_ttft_ms, llm_total_ms, tts_ms, time_to_first_audio_ms.
+  // Build a tiny two-column table so the ms numbers line up.
+  const rows = [
+    ["STT",              msg.stt_ms],
+    ["LLM first token",  msg.llm_ttft_ms],
+    ["LLM full answer",  msg.llm_total_ms],
+    ["TTS",              msg.tts_ms],
+  ];
+  const html = ["<table>"];
+  for (const [name, ms] of rows) {
+    html.push(`<tr><td>${name}</td><td>${ms.toFixed(0)} ms</td></tr>`);
+  }
+  html.push(
+    `<tr class="ttfa"><td>Time to first audio</td>` +
+    `<td>${msg.time_to_first_audio_ms.toFixed(0)} ms</td></tr>`
+  );
+  html.push("</table>");
+  latencyEl.innerHTML = html.join("");
+}
+
 // -----------------------------------------------------------------------------
-// start(): wire up mic → worklet → WebSocket.
+// start(): mic + worklet + two AudioContexts + WebSocket.
 // -----------------------------------------------------------------------------
 async function start() {
   startBtn.disabled = true;
 
   try {
-    // 1) Ask the browser for the microphone.
-    //
-    //    - channelCount: 1          → mono. We don't need stereo for speech.
-    //    - echoCancellation: true   → Chrome removes playback-into-mic echo.
-    //    - noiseSuppression: true   → Chrome dampens steady background noise.
-    //    - autoGainControl: true    → Chrome auto-normalizes loudness.
-    //
-    //    These three "cleanup" flags make downstream speech-to-text much
-    //    happier. They're hints to the browser; it may ignore any of them.
+    // 1) Mic access with the three "cleanup" hints Chrome supports.
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -103,99 +134,56 @@ async function start() {
     });
     log("mic granted", "ok");
 
-    // 2) Create an AudioContext asking for a 16 kHz sample rate.
-    //
-    //    The mic probably captures at 48 kHz natively. By requesting 16000 Hz
-    //    here, we ask the browser to resample for us — much simpler than
-    //    writing a resampler ourselves. If the browser can't honor it, we
-    //    warn the user; otherwise the whole pipeline runs at 16 kHz end-to-end.
-    audioContext = new AudioContext({ sampleRate: 16000 });
-    log(`AudioContext sampleRate = ${audioContext.sampleRate}`);
-    if (audioContext.sampleRate !== 16000) {
-      log(`WARNING: expected 16000 Hz, got ${audioContext.sampleRate}. ` +
-          `The .wav will play back at the wrong speed.`, "warn");
+    // 2) Mic AudioContext — pinned to 16 kHz so the browser resamples for us.
+    micContext = new AudioContext({ sampleRate: 16000 });
+    log(`mic AudioContext sampleRate = ${micContext.sampleRate}`);
+    if (micContext.sampleRate !== 16000) {
+      log(`WARNING: expected 16000 Hz, got ${micContext.sampleRate}.`, "warn");
     }
 
-    // 3) Load the worklet module. The URL is resolved relative to this page.
-    //    This fetches the .js file, parses it in the audio thread's realm,
-    //    and runs its top-level registerProcessor() call so "mic-chunker"
-    //    becomes a known processor name we can instantiate next.
-    await audioContext.audioWorklet.addModule("mic-worklet.js");
+    // 3) SEPARATE playback AudioContext at the system default rate (typically
+    //    48 kHz on macOS). We can't reuse the mic context for TTS playback
+    //    because its 16 kHz rate would downsample the MP3 to telephone
+    //    quality. We create it INSIDE this click handler so Chrome's autoplay
+    //    rule accepts it as a user gesture — no "AudioContext was not allowed
+    //    to start" warning later.
+    playbackContext = new AudioContext();
+    log(`playback AudioContext sampleRate = ${playbackContext.sampleRate}, ` +
+        `state = ${playbackContext.state}`);
+    if (playbackContext.state === "suspended") {
+      // Belt-and-braces: resume() so the context is live even if Chrome
+      // defaulted it to suspended.
+      await playbackContext.resume();
+      log(`playback AudioContext resumed, state = ${playbackContext.state}`);
+    }
 
-    // 4) Build the audio graph:
-    //       mic source --> workletNode
-    //
-    //    Note that we do NOT connect workletNode to audioContext.destination.
-    //    If we did, you'd hear yourself through the speakers (bad for echo).
-    //    The worklet only sends data out via its message port.
-    const source = audioContext.createMediaStreamSource(mediaStream);
-    workletNode = new AudioWorkletNode(audioContext, "mic-chunker");
+    // 4) Load the worklet, hook up mic -> worklet. No connection to
+    //    destination — we don't want to hear ourselves.
+    await micContext.audioWorklet.addModule("mic-worklet.js");
+    const source = micContext.createMediaStreamSource(mediaStream);
+    workletNode = new AudioWorkletNode(micContext, "mic-chunker");
     source.connect(workletNode);
 
-    // 5) Open the WebSocket. We send to the same host that served this page,
-    //    so it works whether you're on localhost or a LAN IP.
+    // 5) WebSocket. Set binaryType BEFORE onmessage so MP3 payloads
+    //    arrive as ArrayBuffer, not Blob.
     ws = new WebSocket(`ws://${location.host}/ws`);
     ws.binaryType = "arraybuffer";
 
-    // Only start forwarding audio once the socket is open, and only after
-    // we've sent the "start" control message so the server knows the format.
     ws.onopen = () => {
       log("WebSocket open — sending start", "ok");
       ws.send(JSON.stringify({ type: "start", sample_rate: 16000 }));
       setStatus("🎧 listening...", "listening");
 
-      // Attach the worklet-message handler here (not earlier) so we don't
-      // try to send audio chunks over a socket that isn't open yet.
+      // Only forward audio once the socket is open.
       workletNode.port.onmessage = (event) => {
-        // event.data is an ArrayBuffer of Int16 samples (640 bytes = 320 samples).
-        // Send it as a BINARY WebSocket frame — not base64, not JSON.
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(event.data);
         }
       };
-
       stopBtn.disabled = false;
     };
 
-    // Messages from the server are JSON text (vad events + the final summary).
-    ws.onmessage = (event) => {
-      if (typeof event.data !== "string") {
-        log(`server: <binary ${event.data.byteLength} bytes>`);
-        return;
-      }
-      log(`server: ${event.data}`);
-
-      let msg;
-      try { msg = JSON.parse(event.data); } catch { return; }
-
-      if (msg.type === "vad") {
-        // Any new speech_start cancels a pending "end of turn" flash.
-        if (endTurnFlashTimer) {
-          clearTimeout(endTurnFlashTimer);
-          endTurnFlashTimer = null;
-        }
-        if (msg.event === "speech_start") {
-          setStatus("🎤 speaking...", "speaking");
-        } else if (msg.event === "turn_end") {
-          setStatus(`✅ end of turn (${msg.duration_s.toFixed(1)} s)`, "ended");
-          // Fall back to the listening state after a short beat so the user
-          // sees the confirmation but doesn't get stuck on it.
-          endTurnFlashTimer = setTimeout(() => {
-            // Only revert if the mic is still live.
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              setStatus("🎧 listening...", "listening");
-            }
-            endTurnFlashTimer = null;
-          }, 1500);
-        }
-      } else if (msg.type === "summary") {
-        setStatus(
-          `done — ${msg.turns} turn(s), ${msg.duration_s.toFixed(1)}s total`,
-          ""
-        );
-      }
-    };
-
+    ws.onmessage = handleServerMessage;
     ws.onerror = () => log("WebSocket error", "err");
     ws.onclose = (e) => log(`WebSocket closed (code ${e.code})`);
 
@@ -207,13 +195,100 @@ async function start() {
 }
 
 // -----------------------------------------------------------------------------
-// stop(): tell the server to finalize, then tear down the local pipeline.
+// handleServerMessage(): one place for both JSON and binary frames.
+// -----------------------------------------------------------------------------
+async function handleServerMessage(event) {
+  // Binary = MP3 from TTS. Decode and play, then tell the server when
+  // playback starts and ends so it can compute "time to first audio" and
+  // free the busy latch.
+  if (typeof event.data !== "string") {
+    const mp3 = event.data;              // ArrayBuffer
+    log(`server: <mp3 ${mp3.byteLength} bytes>`);
+    try {
+      await playMp3(mp3);
+    } catch (err) {
+      log(`playback failed: ${err.message}`, "err");
+    }
+    return;
+  }
+
+  // Text = JSON. Log the raw line and then route by type.
+  log(`server: ${event.data}`);
+  let msg;
+  try { msg = JSON.parse(event.data); } catch { return; }
+
+  switch (msg.type) {
+    case "vad":
+      if (msg.event === "speech_start") {
+        setStatus("🎤 speaking...", "speaking");
+      } else if (msg.event === "turn_end") {
+        // The pipeline is now working on this turn. Jump straight to
+        // "thinking" — no end-of-turn flash to compete with it.
+        setStatus("💭 thinking...", "thinking");
+      }
+      break;
+
+    case "transcript":
+      log(`You: ${msg.text}  (lang=${msg.language})`, "you");
+      break;
+
+    case "answer":
+      log(`Toy: ${msg.text}`, "toy");
+      break;
+
+    case "latency":
+      renderLatency(msg);
+      break;
+
+    case "error":
+      log(`server error [${msg.stage}]: ${msg.message}`, "err");
+      // Server has cleared busy; fall back to listening so the next turn
+      // can start.
+      setStatus("🎧 listening...", "listening");
+      break;
+
+    case "summary":
+      setStatus(
+        `done — ${msg.turns} turn(s), ${msg.duration_s.toFixed(1)}s total`,
+        ""
+      );
+      break;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// playMp3(): decode on the playback context, then start().
+//
+// decodeAudioData DETACHES the input ArrayBuffer, so we can't reuse it after.
+// That's fine; we don't need the raw bytes once the AudioBuffer exists.
+// -----------------------------------------------------------------------------
+async function playMp3(arrayBuffer) {
+  if (!playbackContext) throw new Error("no playback context");
+  const audioBuffer = await playbackContext.decodeAudioData(arrayBuffer);
+
+  const srcNode = playbackContext.createBufferSource();
+  srcNode.buffer = audioBuffer;
+  srcNode.connect(playbackContext.destination);
+
+  // Fire-and-forget: when the source finishes, tell the server.
+  srcNode.onended = () => {
+    sendControl({ type: "playback_ended" });
+    log("playback ended");
+    setStatus("🎧 listening...", "listening");
+  };
+
+  // Start playback FIRST, then immediately tell the server. The server
+  // takes this as "time to first audio" on the client clock.
+  srcNode.start();
+  sendControl({ type: "playback_started" });
+  setStatus("🔊 talking...", "talking");
+}
+
+// -----------------------------------------------------------------------------
+// stop() + cleanup()
 // -----------------------------------------------------------------------------
 async function stop() {
   stopBtn.disabled = true;
-
-  // Tell the server we're done so it writes the .wav and sends the summary.
-  // Do this BEFORE tearing anything else down, so the message is actually sent.
   try {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "stop" }));
@@ -221,44 +296,33 @@ async function stop() {
   } catch (err) {
     log(`stop send failed: ${err.message}`, "err");
   }
-
   await cleanup();
   startBtn.disabled = false;
 }
 
-// -----------------------------------------------------------------------------
-// cleanup(): tear down the mic, the audio graph, and (eventually) the socket.
-// Safe to call multiple times — every step guards for null.
-// -----------------------------------------------------------------------------
 async function cleanup() {
-  // Cancel any pending "end of turn" flash so it doesn't fight the final status.
-  if (endTurnFlashTimer) { clearTimeout(endTurnFlashTimer); endTurnFlashTimer = null; }
-
-  // Stop forwarding audio immediately so no chunks arrive after "stop".
   if (workletNode) {
     try { workletNode.port.onmessage = null; workletNode.disconnect(); } catch {}
     workletNode = null;
   }
-
-  // Stop the physical mic (turns off the browser's recording indicator).
   if (mediaStream) {
     mediaStream.getTracks().forEach((t) => t.stop());
     mediaStream = null;
   }
-
-  // Close the audio graph.
-  if (audioContext) {
-    try { await audioContext.close(); } catch {}
-    audioContext = null;
+  if (micContext) {
+    try { await micContext.close(); } catch {}
+    micContext = null;
   }
-
-  // Give the server a brief grace period to deliver its summary message
-  // before we close the socket. 1 second is plenty for a tiny JSON reply.
+  if (playbackContext) {
+    try { await playbackContext.close(); } catch {}
+    playbackContext = null;
+  }
   if (ws) {
     const closing = ws;
     ws = null;
     setTimeout(() => {
-      if (closing.readyState === WebSocket.OPEN) closing.close();
+      // Code 1000 = normal closure; explicit so the server log is unambiguous.
+      if (closing.readyState === WebSocket.OPEN) closing.close(1000, "stop");
     }, 1000);
   }
 }

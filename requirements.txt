@@ -6,5 +6,10 @@ silero-vad>=6.0          # pulls torch transitively
 onnxruntime>=1.17        # used by silero-vad when onnx=True
 numpy>=1.26              # Int16 -> float32 conversion for VAD input
 
+# External APIs (Phase 3)
+anthropic>=2.3           # async client for Claude Haiku
+httpx>=0.28              # async HTTP for ElevenLabs STT + TTS
+python-dotenv>=1.0       # load API keys from .env
+
 # Tests
 pytest>=8.0

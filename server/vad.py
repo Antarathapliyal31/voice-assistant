@@ -39,6 +39,9 @@ MIN_SPEECH_MS   = 250    # need this much consecutive speech to confirm a start
 MIN_SILENCE_MS  = 900    # need this much consecutive silence to confirm an end
 PREROLL_MS      = 200    # keep this much pre-speech audio so the first syllable
                          # isn't cut off by the "min speech" latency
+TRAILING_KEEP_MS = 100   # on turn_end, strip the long trailing silence that
+                         # MIN_SILENCE_MS added — keep only this much so the
+                         # last word's release isn't clipped
 
 # -----------------------------------------------------------------------------
 # Fixed facts about the model / audio format. Not tunable.
@@ -199,16 +202,55 @@ class TurnDetector:
                 self._silence_run += 1
                 if self._silence_run >= MIN_SILENCE_WINDOWS:
                     assert self._utt is not None
-                    utt_bytes = bytes(self._utt)
+                    utt_bytes = self._finalize_utterance()
                     duration_s = len(utt_bytes) / (SAMPLE_RATE * SAMPLE_WIDTH)
                     events.append({
                         "type": "turn_end",
                         "pcm_bytes": utt_bytes,
                         "duration_s": duration_s,
                     })
-                    self._state = State.SILENT
-                    self._utt = None
-                    self._silence_run = 0
-                    self._speech_run = 0
             # else: score is in the hysteresis band — stay MAYBE_DONE,
             # don't bump the silence counter.
+
+    # ------------------------------------------------------------------- flush
+    def flush(self) -> list[dict]:
+        """If an utterance is in progress, finalize it and return turn_end.
+
+        Called from main.py when the client sends "stop" so a half-spoken
+        question isn't lost (we still save a .wav for whatever we captured).
+        """
+        if self._state is State.SILENT or self._utt is None:
+            return []
+        utt_bytes = self._finalize_utterance()
+        duration_s = len(utt_bytes) / (SAMPLE_RATE * SAMPLE_WIDTH)
+        return [{"type": "turn_end", "pcm_bytes": utt_bytes, "duration_s": duration_s}]
+
+    # ---------------------------------------------------------------- helpers
+    def _finalize_utterance(self) -> bytes:
+        """Snap the utterance buffer, trim the long trailing silence, and reset.
+
+        Must only be called when self._utt is not None. We trim here (not at
+        the point of emission) so flush() can reuse the exact same logic.
+        """
+        assert self._utt is not None
+        utt_bytes = self._trim_trailing_silence(bytes(self._utt))
+        # Reset for the next turn.
+        self._state = State.SILENT
+        self._utt = None
+        self._silence_run = 0
+        self._speech_run = 0
+        return utt_bytes
+
+    def _trim_trailing_silence(self, utt_bytes: bytes) -> bytes:
+        """Keep only ~TRAILING_KEEP_MS of the trailing silence at the end.
+
+        Normal turn_end: MIN_SILENCE_WINDOWS of silence are at the tail (the
+        counter had to reach that to fire). We keep KEEP windows and trim the
+        rest. flush() case: self._silence_run is whatever we had so far.
+        """
+        keep_windows = max(1, math.ceil(TRAILING_KEEP_MS / WINDOW_MS))
+        trim_windows = max(0, self._silence_run - keep_windows)
+        trim_bytes = trim_windows * WINDOW_BYTES
+        if trim_bytes <= 0 or trim_bytes >= len(utt_bytes):
+            return utt_bytes
+        return utt_bytes[:-trim_bytes]

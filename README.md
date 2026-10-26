@@ -61,3 +61,57 @@ After you click Stop you'll see something like:
 Browsers only allow `getUserMedia` on secure origins. `http://localhost` is
 treated as secure, so it works without TLS. A LAN IP (e.g. `http://192.168.…`)
 would require HTTPS.
+
+## Phase 3 — naive STT → LLM → TTS pipeline
+
+The naive baseline runs stages strictly sequentially: STT must finish before
+the LLM starts, LLM must finish before TTS starts. Phase 4 will overlap them;
+these numbers are what we're trying to beat.
+
+### Sample run (2026-10-25, M-series laptop)
+
+**Turn 1 — "Why is the sky blue?"**
+
+| Stage | ms from `turn_end` |
+|---|--:|
+| STT | 544 |
+| LLM first token | 1016 |
+| LLM full answer | 1342 |
+| TTS | 1813 |
+| **Time to first audio** | **1836** |
+
+**Turn 2 — follow-up: "The sunlight bounces around in the air. What does that mean?"**
+
+| Stage | ms from `turn_end` |
+|---|--:|
+| STT | 1204 |
+| LLM first token | 1714 |
+| LLM full answer | 2500 |
+| TTS | 3312 |
+| **Time to first audio** | **3356** |
+
+The ~1.8–3.4 s first-audio delay is the "slow baseline" we expect: everything
+is serialized, and the TTS can't begin until Claude's last token has arrived.
+
+### Example turn (from the on-page log)
+
+```
+server: {"type": "vad", "event": "speech_start"}
+server: {"type": "vad", "event": "turn_end",
+         "file": "utt-20261025-233904-070.wav", "duration_s": 3.136}
+server: {"type": "transcript", "text": "Why is the sky blue?", "language": "eng"}
+You:    Why is the sky blue?  (lang=eng)
+server: {"type": "answer", "text": "The sky is blue because of how sunlight
+         bounces around in the air! The blue light travels in tiny waves that
+         spread out more than other colors, so we see lots of blue all around us."}
+Toy:    The sky is blue because of how sunlight bounces around in the air! ...
+server: <mp3 189796 bytes>
+server: {"type": "latency", "mode": "naive",
+         "stt_ms": 603.8, "llm_ttft_ms": 1077.9, "llm_total_ms": 1542.6,
+         "tts_ms": 2390.6, "time_to_first_audio_ms": 2426.5}
+playback ended
+```
+
+Each turn is also appended to `logs/latency.jsonl` (gitignored) with the full
+transcript, answer, and timestamp — useful for comparing against Phase 4
+later.
